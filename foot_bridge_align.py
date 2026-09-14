@@ -18,8 +18,7 @@ import numpy as np
 from rembg import new_session
 
 from alignment_common import (
-    LaserError,
-    CameraError,
+    AlignmentError,
     AxisConfig,
     align_axis,
     get_logger,
@@ -136,12 +135,9 @@ def main() -> None:
     try:
         align_axis(motor, vertical_config, find_vertical_bridge_row, debug_folder)
         align_axis(motor, horizontal_config, find_horizontal_bridge_row, debug_folder)
-    except CameraError:
+    except AlignmentError as exc:
         logger.exception("Alignment aborted")
-        sys.exit(11)
-    except LaserError:
-        logger.exception("Alignment aborted")
-        sys.exit(10)
+        sys.exit(exc.exit_code)
     finally:
         motor.close()
 

@@ -22,7 +22,7 @@ import numpy as np
 import pygame
 from PIL import ImageDraw
 
-from alignment_common import get_logger, make_debug_folder, segment_foot
+from alignment_common import AlignmentError, CaptureFailedError, LaserNotDetectedError, get_logger, make_debug_folder, segment_foot
 from utils import HorizontalDirection, Motor, capture_save, laser_dot_detec_hrz, retry
 
 logger = get_logger(__name__, level=logging.INFO)
@@ -144,8 +144,7 @@ def main() -> None:
         # capture image from camera and save it to file, returning the file path
         file = retry(capture_save, "top", debug_folder)
         if file is None:
-            logger.exception("Alignment aborted")
-            sys.exit(11)
+            raise CaptureFailedError("Failed to capture frame for horizontal toe alignment")
 
         logger.info("analysing file: %s", file)
         input_img = file.read_bytes()
@@ -521,8 +520,7 @@ def main() -> None:
             # would raise a confusing TypeError deep in string formatting if the
             # laser wasn't found, rather than failing clearly. Now it fails the
             # same way the other alignment scripts do.
-            logger.error("Laser dot not detected in image during horizontal toe alignment.")
-            sys.exit(10)
+            raise LaserNotDetectedError("Laser dot not detected during horizontal toe alignment")
 
         logger.debug("position of laser: %f", laser_c_row)
 
@@ -551,6 +549,9 @@ def main() -> None:
         except Exception:
             logger.exception("Horizontal toe positioning failed")
 
+    except AlignmentError as exc:
+        logger.exception("Horizontal toe alignment aborted")
+        sys.exit(exc.exit_code)
     finally:
         motor.close()
 

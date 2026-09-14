@@ -32,11 +32,30 @@ from rembg import remove
 from utils import Motor, capture_save, retry
 
 
-class CameraError(Exception):
-    """Raised when alignment cannot proceed due to camera issues."""
+# Exit codes shared across every script that uses this module (and by
+# move_sensor_limit_horizontal.py, which doesn't use align_axis but should
+# still fail consistently): 10 for laser detection failure, 11 for image
+# capture failure, 12 for a horizontal movement failure (e.g. homing timeout).
+EXIT_LASER_NOT_DETECTED = 10
+EXIT_CAPTURE_FAILED = 11
+EXIT_MOVEMENT_FAILED = 12
 
-class LaserError(Exception):
-    """Raised when alignment cannot proceed as laser dot not found."""
+
+class AlignmentError(Exception):
+    """Base class for alignment failures. Subclasses set `exit_code` so a
+    caller can do `sys.exit(exc.exit_code)` without needing to know which
+    specific failure occurred."""
+    exit_code = 1
+
+
+class CaptureFailedError(AlignmentError):
+    """Raised when a frame could not be captured after retries."""
+    exit_code = EXIT_CAPTURE_FAILED
+
+
+class LaserNotDetectedError(AlignmentError):
+    """Raised when the laser dot could not be detected after retries."""
+    exit_code = EXIT_LASER_NOT_DETECTED
 
 
 # --------------------------------------------------------------------------
@@ -257,7 +276,7 @@ def align_axis(
         file = retry(capture_save, config.camera_position, debug_folder, retries=config.capture_retries)
         if file is None:
             logger.error("Could not capture frame for %s alignment.", config.name)
-            raise CameraError(f"Failed to capture frame during {config.name} alignment")
+            raise CaptureFailedError(f"Failed to capture frame during {config.name} alignment")
 
         if iteration == 1:
             target_row = detect_target_row_with_retries(file, config, find_target_row, debug_folder)
@@ -268,7 +287,7 @@ def align_axis(
         laser_row = retry(config.laser_detect_fn, file)
         if laser_row is None:
             logger.error("Laser dot not detected in image after retries.")
-            raise LaserError(f"Laser dot not detected during {config.name} alignment")
+            raise LaserNotDetectedError(f"Laser dot not detected during {config.name} alignment")
 
         sensor_row = laser_row + config.laser_offset_sign * config.laser_to_sensor_offset
         distance_motor = target_row - sensor_row
