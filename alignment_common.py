@@ -35,11 +35,12 @@ from utils import Motor, capture_save, retry
 # Exit codes shared across every script that uses this module (and by
 # move_sensor_limit_horizontal.py, which doesn't use align_axis but should
 # still fail consistently): 10 for laser detection failure, 11 for image
-# capture failure, 12 for a horizontal movement failure (e.g. homing timeout).
+# capture failure, 12 for a horizontal movement failure (e.g. homing timeout)
+# 13 for a PC/SSH connection failure.
 EXIT_LASER_NOT_DETECTED = 10
 EXIT_CAPTURE_FAILED = 11
 EXIT_MOVEMENT_FAILED = 12
-
+EXIT_CONNECTION_FAILED = 13
 
 class AlignmentError(Exception):
     """Base class for alignment failures. Subclasses set `exit_code` so a
