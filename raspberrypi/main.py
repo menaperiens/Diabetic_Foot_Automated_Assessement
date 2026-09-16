@@ -24,7 +24,7 @@ from time import sleep
 from gpiozero import Button
 from stopit import ThreadingTimeout, TimeoutException
 
-from alignment_common import EXIT_LASER_NOT_DETECTED as LASER_NOT_DETECTED_RETURN_CODE
+from alignment_common import EXIT_LASER_NOT_DETECTED as LASER_NOT_DETECTED_RETURN_CODE, EXIT_CAPTURE_FAILED 
 
 # --- Configuration -----------------------------------------------------
 
@@ -249,7 +249,10 @@ def run_forever(watchdog):
                 "Stage '%s' failed with return code %d. Aborting this run.",
                 e.cmd, e.returncode,
             )
-            print(f"Erro. Requerida a atenção de um técnico.")
+            if e.returncode == LASER_NOT_DETECTED_RETURN_CODE:
+              print("Erro na deteção do laser. Requerida a atenção de um técnico.")
+            if e.returncode == EXIT_CAPTURE_FAILED:
+              print("Erro relativo às câmaras. Requerida a atenção de um técnico.")
         except Exception:
             logging.exception("Unexpected error during pipeline run.")
             print("Erro inesperado. Requerida a atenção de um técnico.")
