@@ -130,6 +130,7 @@ def main() -> None:
         max_iterations=MAX_HORIZONTAL_ITERATIONS,
         stop_condition=lambda m: m.stp_lim_back.is_pressed,
         use_alpha_matting=True,
+        debug_image_name="bridge_position_(horizontal_row)"
     )
 
     try:
