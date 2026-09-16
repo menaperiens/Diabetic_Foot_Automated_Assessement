@@ -14,13 +14,16 @@ consistent error handling / confirm-before-move), not the control loop.
 
 from __future__ import annotations
 
+import io
 import logging
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import pygame
-from PIL import ImageDraw
+from PIL import Image, ImageDraw
+from rembg import remove
 
 from alignment_common import AlignmentError, CaptureFailedError, LaserNotDetectedError, get_logger, make_debug_folder, segment_foot
 from utils import HorizontalDirection, Motor, capture_save, laser_dot_detec_hrz, retry
@@ -107,20 +110,7 @@ def red_line_y(x, side, left_margin, right_margin, col_of_first_true, middle_lin
             # ascending, so interpolate linearly between the two endpoints.
             t = (x - col_of_first_true) / (right_margin - col_of_first_true)
             return middle_line_l + t * (middle_line_r - middle_line_l)
-                # Linear interpolation of the red line between two points:
-                    # We map:
-                    #   x = col_of_first_true  -> y = middle_line_l   (left endpoint)
-                    #   x = right_margin       -> y = middle_line_r   (right endpoint)
-                    #
-                    # Step 1: Normalize x into a parameter t in [0, 1]
-                    #   t = (x - col_of_first_true) / (right_margin - col_of_first_true)
-                    #   -> t = 0 corresponds to the left endpoint
-                    #   -> t = 1 corresponds to the right endpoint
-                    #
-                    # Step 2: Interpolate y linearly between the two endpoints
-                    #   y = middle_line_l + t * (middle_line_r - middle_line_l)
-                    # This produces a straight line connecting the two points.
-                    
+
     if side == "left":
         if x <= col_of_first_true:
             t = (x - left_margin) / (col_of_first_true - left_margin)
@@ -177,8 +167,7 @@ def main() -> None:
         cols_in_first_row = np.where(mask[first_row])[0]  # columns where the first row with foot is True
 
         col_of_first_true = cols_in_first_row[0]  # first (left-most) column in that row: starting point
-        # to determine if the foot is on the left or right side of the body. Corresponds
-        # to the tip of the big toe.
+        # to determine if the foot is on the left or right side of the body.
 
         side = "left" if col_of_first_true > left_margin + width / 2 else "right"
         # If the first (left-most) pixel in the top-most row is in the right half of the
@@ -216,56 +205,49 @@ def main() -> None:
         # computed above. Starting from the outer edge, we move inward column by
         # column until the threshold is crossed or the estimate stops improving.
         if side == "right":
-            toe_start_left = first_row  # the big (left-most) toe is easy: it's the highest (lowest-row) point in the foot
-            logger.info("Big toe starts at row: %d", toe_start_left)
-            
-            while toe_start_right > threshold: 
+            toe_start_left = first_row  # the left-most toe is easy: it's the highest (lowest-row) point in the foot
+
+            while toe_start_right > threshold:
                 offset = int(offset_tolerance * width)
                 logger.debug("offset: %d", offset)
-            
-                col_right = mask[:, right_margin - offset]   # select vertical column near right edge; 
-                # moves inward each iteration due to offset, so that if threshold hasnt been reached we 
-                # look further to the left for the start of the toe
+
+                col_right = mask[:, right_margin - offset]
                 logger.debug("col_right: %d", right_margin - offset)
-            
-                if np.any(col_right): 
-                    toe_start_right_new = np.argmax(col_right) # select the first (top-most) row pixel
-                    # in that column, which corresponds to the start of the foot in that column
-                    offset_tolerance += 0.01 # in each iteration, increase the offset to look for
-                    # the start of the toe further inward, in case we haven't reached the threshold yet.
-            
-                    if toe_start_right_new <= toe_start_right:  # only update if we found a row closer to the threshold
-            
+
+                if np.any(col_right):
+                    toe_start_right_new = np.argmax(col_right)
+                    offset_tolerance += 0.01
+
+                    if toe_start_right_new <= toe_start_right:
                         toe_start_right = toe_start_right_new
-                        logger.debug("Current estimate for pinky toe start row: %d", toe_start_right)
-            
-                    else: # if we are not getting closer to the threshold, to avoid infinite loop, 
-                        # we break and take the last toe_start_right as the start of the pinky toe.
+                        logger.debug("Current estimate for toe (right) start row: %d", toe_start_right)
+                    else:
                         logger.debug("breaking loop")
-                        logger.info("Pinky toe starts at row: %d", toe_start_right)
+                        logger.info("Toe (right) starts at row: %d", toe_start_right)
                         break
-                else: # otherwise go deeper in
+                else:
                     offset_tolerance += 0.02
-            
+            logger.info("Toe (left) starts at row: %d", toe_start_left)
+
         elif side == "left":
             toe_start_right = first_row
-            logger.info("Big toe starts at row: %d", toe_start_right)
             while toe_start_left > threshold:
                 offset = int(offset_tolerance * width)
                 col_left = mask[:, left_margin + offset]
                 if np.any(col_left):
                     toe_start_left_new = np.argmax(col_left)
                     offset_tolerance += 0.01
-                    logger.debug("Current estimate for pinky toe start row: %d", toe_start_left_new)
+                    logger.debug("Current estimate for toe (left) start row: %d", toe_start_left_new)
                     if toe_start_left_new <= toe_start_left:
                         toe_start_left = toe_start_left_new
                     else:
                         logger.debug("breaking loop")
-                        logger.info("Pinky toe starts at row: %d", toe_start_left)
+                        logger.info("Toe (left) starts at row: %d", toe_start_left)
                         break
                 else:
                     offset_tolerance += 0.02
-            
+            logger.info("Toe (right) starts at row: %d", toe_start_right)
+
         else:
             raise ValueError("side must be 'left' or 'right'")
 
@@ -276,26 +258,24 @@ def main() -> None:
         foot_height_l = foot_finish - toe_start_left
 
         # Toe height estimated as a proportion of foot height, based on the average
-        # foot shape/size in the population this was tuned on. For this population
-        # I measured the legnth of the foot (px) and the length of each toe (px) 
-        # and computed the average ratio of toe length to foot length.
+        # foot shape/size in the population this was tuned on.
         if side == "right":
             toe_height_r = foot_height_r * 0.187
             toe_finish_right = int(toe_start_right + toe_height_r)
-            logger.info("Pinky toe finishes at row: %d", toe_finish_right)
+            logger.info("Toe (right) finishes at row: %d", toe_finish_right)
 
             toe_height_l = foot_height_l * 0.270
             toe_finish_left = int(toe_start_left + toe_height_l)
-            logger.info("Big toe finishes at row: %d", toe_finish_left)
+            logger.info("Toe (left) finishes at row: %d", toe_finish_left)
 
         elif side == "left":
             toe_height_r = foot_height_r * 0.318
             toe_finish_right = int(toe_start_right + toe_height_r)
-            logger.info("Big toe finishes at row: %d", toe_finish_right)
+            logger.info("Toe (right) finishes at row: %d", toe_finish_right)
 
             toe_height_l = foot_height_l * 0.224
             toe_finish_left = int(toe_start_left + toe_height_l)
-            logger.info("Pinky toe finishes at row: %d", toe_finish_left)
+            logger.info("Toe (left) finishes at row: %d", toe_finish_left)
 
         else:
             logger.error("Invalid side value: %s", side)
@@ -395,31 +375,9 @@ def main() -> None:
         # side of body, as a starting point for interactive marking. Row position
         # for all toes starts on the middle (red) line.
         if side == "right":
-            # the big toe column is generally located at a certain proportion 
-            # of the width of the foot from the left edge (for right foot). 
-            # We estimated that the optimal value for this proportion is 1/8. 
-            # The big toe is the biggest, so this proportion had to be greater 
-            # than (1/5)/2, which would make all 
-            # toes the same lenght. We divide by 2 because we want the to 
-            # arrive at the position in the middle of the toe, not at its lenght. So 
-            # So if we assume the big toe is 1/4 the width of the foot, 
-            # then its middle would be located at 1/8 of the width of 
-            # the foot from the left edge for the right foot.
-            big_toe_col = left_margin+1/8*width 
-
-            # Then 3/4* width are left for the other 4 toes,
-            #  so each toe is by default located 3/4 * 1/4 
-            # (+ half-lenght of previous toe) 
-            # of the width, so we add this to the position 
-            # of the big toe to get the initial position of the index toe.
-            index_toe_col = big_toe_col+(1/8+(3/4*1/4)/2)*width 
-
-            # Now its the same for every other toe. 3/4 * 1/4 = 3/16,
-            #  so we add this to the position of the index toe to
-            #  get the initial position of the middle toe, and so on
-            # (we dont divide by 2, we just add one toe
-            # length to already arrive at the middle of the middle toe)
-            middle_toe_col = index_toe_col+3/16*width 
+            big_toe_col = left_margin + 1 / 8 * width
+            index_toe_col = big_toe_col + (1 / 8 + (3 / 4 * 1 / 4) / 2) * width
+            middle_toe_col = index_toe_col + 3 / 16 * width
             ring_toe_col = middle_toe_col + 3 / 16 * width
             pinky_toe_col = ring_toe_col + 3 / 16 * width
         else:
@@ -443,13 +401,6 @@ def main() -> None:
             "Utilize a as setas direita e esquerda para mover o ponto amarelo e presse Enter quando o ponto "
             "estiver na posicao certa. Isto deve ser feito para cada um dos dedos. Presse Enter para comecar."
         )
-
-        #Now we proceed to the interactive marking of the individual 
-        #toe positions. We will mark the position of each 
-        #toe by moving a dot on the image with the arrow keys, and pressing Enter when 
-        #we are satisfied with the position of the dot for each toe. 
-        #We will start with the big toe, 
-        #then index toe, middle toe, ring toe and pinky toe.
 
         pygame.init()
         screen = pygame.display.set_mode((800, 600))
@@ -487,21 +438,17 @@ def main() -> None:
                     toe_col += 1 * width // 100
                     toe_row = red_line_y(toe_col, side, left_margin, right_margin, col_of_first_true, final_middle_line_l, final_middle_line_r)
 
-                # rebuild image
                 surface = build_surface_ind_toe(img, toe_row, toe_col)
 
-                # scale the image to fit the screen while maintaining aspect ratio
                 img_w, img_h = surface.get_size()
                 screen_w, screen_h = screen.get_size()
                 scale = min(screen_w / img_w, screen_h / img_h)
                 new_size = (int(img_w * scale), int(img_h * scale))
                 surface = pygame.transform.scale(surface, new_size)
 
-                # center image
                 x = (screen_w - new_size[0]) // 2
                 y = (screen_h - new_size[1]) // 2
 
-                # draw image
                 screen.fill((255, 255, 255))
                 screen.blit(surface, (x, y))
                 pygame.display.flip()
@@ -520,6 +467,7 @@ def main() -> None:
             # would raise a confusing TypeError deep in string formatting if the
             # laser wasn't found, rather than failing clearly. Now it fails the
             # same way the other alignment scripts do.
+            logger.error("Laser dot not detected in image.")
             raise LaserNotDetectedError("Laser dot not detected during horizontal toe alignment")
 
         logger.debug("position of laser: %f", laser_c_row)
