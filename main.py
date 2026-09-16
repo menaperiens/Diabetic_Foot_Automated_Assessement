@@ -237,22 +237,22 @@ def run_forever(watchdog):
                 run_pipeline()
         except TimeoutException:
             logging.error("Pipeline took too long. Aborting.")
-            print("Pipeline took too long. Aborting.")
+            print("Pipeline demorou demasiado tempo. Abortando.")
         except subprocess.TimeoutExpired as e:
             logging.error(
                 "Stage '%s' did not finish within %ds and was killed. Aborting this run.",
                 e.cmd, e.timeout,
             )
-            print(f"A stage timed out ({e.cmd}). Check main.log for details.")
+            print(f"Uma etapa do teste demorou demasiado tempo. Abortando.")
         except subprocess.CalledProcessError as e:
             logging.error(
                 "Stage '%s' failed with return code %d. Aborting this run.",
                 e.cmd, e.returncode,
             )
-            print(f"A stage failed ({e.cmd}). Check main.log for details.")
+            print(f"Erro. Requerida a atenção de um técnico.")
         except Exception:
             logging.exception("Unexpected error during pipeline run.")
-            print("Unexpected error. Check main.log for details.")
+            print("Erro inesperado. Requerida a atenção de um técnico.")
 
         logging.info("Restarting...")
         sleep(2)
