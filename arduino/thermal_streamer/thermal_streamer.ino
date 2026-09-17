@@ -26,10 +26,14 @@
  *   little-endian uint16_t values. There is no length prefix, no checksum,
  *   and no delimiter -- the receiver must know the sizes in advance.
  *
- *     "EE" + 832 uint16  (1664 bytes)  sent once, right after connecting.
- *                                      The sensor's calibration EEPROM dump.
- *                                      The PC needs this before it can
- *                                      convert any frame to temperatures.
+ *     "EE" + 832 uint16  (1664 bytes)  sent once per TCP session, before any
+ *                                      frames. The sensor's calibration
+ *                                      EEPROM dump. The PC needs this before
+ *                                      it can convert any frame to
+ *                                      temperatures, so a receiver that sees
+ *                                      a new connection should expect "EE"
+ *                                      first and discard any cached copy from
+ *                                      a previous session.
  *
  *     "FR" + 834 uint16  (1668 bytes)  sent continuously, two per full image.
  *                                      A raw subpage frame (see loop()).
@@ -113,9 +117,25 @@ static const uint16_t MLX90640_EEPROM_WORDS = 832;
 static uint16_t MLX90640Frame[MLX90640_FRAME_WORDS];
 static paramsMLX90640 params;  // calibration coefficients, unpacked from EEPROM
 
-// Guards the one-shot calibration transmission so a future reconnect does not
-// silently resend it and desynchronise the PC's parser.
+/*
+ * Connection state.
+ *
+ * The calibration dump is per-connection, not per-boot: every time a fresh
+ * TCP session opens, the PC on the other end is a fresh parser that has not
+ * seen an "EE" message yet. So this flag is cleared on disconnect and set
+ * again once calibration has been re-sent on the new socket.
+ */
 bool ee_sent = false;
+
+// Timestamp of the last reconnect attempt, for the non-blocking retry in
+// loop(). Unsigned subtraction makes the comparison safe across the ~49-day
+// millis() rollover, so no special case is needed for it.
+unsigned long lastReconnectAttempt = 0;
+static const unsigned long RECONNECT_INTERVAL_MS = 5000;
+
+// Diagnostics: frames rejected since boot, printed alongside the subpage
+// trace so a bus that is quietly degrading is visible in the serial output.
+unsigned long badFrames = 0;
 
 // Refresh rate code passed to MLX90640_SetRefreshRate(). The register takes a
 // 3-bit exponent, not a rate in Hz:
@@ -123,6 +143,17 @@ bool ee_sent = false;
 // Note this is the SUBPAGE rate, so 4 Hz here yields 2 complete images per
 // second. Pushing higher costs more I2C bandwidth and raises sensor noise.
 static const uint8_t MLX90640_REFRESH_4HZ = 0x03;
+
+
+// Forward declarations. The Arduino IDE generates these automatically, but
+// stating them makes the file valid plain C++ too -- useful if you ever
+// compile it outside the IDE.
+bool connectToServer();
+bool sendCalibration();
+boolean isConnected();
+void printCurrentNet();
+void printWifiData();
+void printMacAddress(byte mac[]);
 
 
 // ===========================================================================
@@ -174,71 +205,110 @@ void setup() {
     printCurrentNet();
     printWifiData();
 
-    // ----- Open the TCP session to the PC ---------------------------------
-
-    if (client.connect(host, port)) {
-        Serial.println("Connected to server (PC)");
-
-        // Drain and echo whatever greeting the PC sends, if any. Purely a
-        // debugging aid -- nothing in the protocol requires a handshake.
-        // Waits up to 5 s for the first byte, then prints what has arrived.
-        unsigned long timeout = millis();
-        while (!client.available() && millis() - timeout < 5000) {}
-
-        while (client.available()) {
-            char c = client.read();
-            Serial.print(c);
-        }
-
-    } else {
-        // NOTE: execution continues either way. If this fails, the sketch
-        // will still talk to the sensor but every client.write() below is a
-        // no-op, so nothing reaches the PC and nothing retries. Worth adding
-        // a reconnect path if you want this to survive the PC restarting.
-        Serial.println("Connection to PC failed");
-    }
-
     // ----- Bring up the sensor --------------------------------------------
+    //
+    // Moved ahead of the TCP connection (it came after, originally) because
+    // connectToServer() now sends the calibration dump as part of opening a
+    // session, and that requires a working sensor to read the dump from.
 
     if (isConnected() == false) {
         Serial.println("MLX9064x not detected at default I2C address. Please check wiring. Freezing.");
         while (1);
     }
 
-    // Renamed from 'status' to avoid shadowing the global WiFi status above.
-    // The original compiled fine, but two different meanings behind one name
-    // in overlapping scopes is a trap.
-    int mlxStatus;
+    MLX90640_SetRefreshRate(MLX90640_address, MLX90640_REFRESH_4HZ);
 
-    // Each sensor is individually calibrated at the factory; its coefficients
-    // live in on-chip EEPROM and must be read out before any conversion.
-    // Declared locally because the PC, not the Arduino, does the converting --
-    // once these bytes are on the wire the board has no further use for them.
+    // ----- Open the TCP session to the PC ---------------------------------
+    //
+    // A failure here is no longer terminal: loop() retries on its own, so the
+    // board can be powered on before the PC-side script is running.
+    connectToServer();
+}
+
+
+// ===========================================================================
+// Connection handling
+// ===========================================================================
+
+/*
+ * Reads the sensor's factory calibration EEPROM and forwards it to the PC.
+ *
+ * Called once per TCP session rather than once per boot. The dump is read
+ * fresh from the sensor each time instead of being cached in a global: at
+ * 1664 bytes that would be a permanent bite out of RAM, which is already at
+ * roughly two-thirds occupancy on this board. Here it lives on the stack for
+ * the few milliseconds the function runs and then goes away.
+ *
+ * Returns true only if the dump was read, validated and sent in full.
+ */
+bool sendCalibration() {
     uint16_t eeMLX90640[MLX90640_EEPROM_WORDS];
 
-    mlxStatus = MLX90640_DumpEE(MLX90640_address, eeMLX90640);
+    int mlxStatus = MLX90640_DumpEE(MLX90640_address, eeMLX90640);
     if (mlxStatus != 0) {
         Serial.println("Failed to load system parameters");
+        return false;
     }
 
     // Unpacks the raw EEPROM into the struct the conversion API expects.
-    // Kept here even though the board never converts anything, because it
-    // also validates the dump -- a failure here means the bytes about to be
-    // sent to the PC are suspect.
+    // The board never converts anything itself, but this doubles as a
+    // validity check: if extraction fails, the bytes are not worth sending.
     mlxStatus = MLX90640_ExtractParameters(eeMLX90640, &params);
     if (mlxStatus != 0) {
-        Serial.println("Parameter extraction failed");
+        Serial.println("Parameter extraction failed -- not sending calibration");
+        return false;
     }
 
-    MLX90640_SetRefreshRate(MLX90640_address, MLX90640_REFRESH_4HZ);
-
-    // Ship the calibration to the PC exactly once, before any frames, so the
-    // receiver has everything it needs to interpret what follows.
-    if (client && !ee_sent) {
-        client.write((const uint8_t*)"EE", 2);
-        client.write((uint8_t*)eeMLX90640, MLX90640_EEPROM_WORDS * 2);
-        ee_sent = true;
+    if (!client.connected()) {
+        return false;
     }
+
+    client.write((const uint8_t*)"EE", 2);
+    client.write((uint8_t*)eeMLX90640, MLX90640_EEPROM_WORDS * 2);
+    client.flush();
+
+    Serial.println("Calibration sent");
+    return true;
+}
+
+/*
+ * Opens a session to the PC and primes it with calibration.
+ *
+ * Returns true only when both halves succeeded, because a socket that is
+ * open but has not been sent an "EE" message is useless to the receiver --
+ * it would be parsing frames it cannot convert.
+ */
+bool connectToServer() {
+    // Releases any half-open socket from a previous session. Without this the
+    // client can hold onto a stale descriptor and refuse to reconnect.
+    client.stop();
+    ee_sent = false;
+
+    Serial.print("Connecting to ");
+    Serial.print(host);
+    Serial.print(":");
+    Serial.println(port);
+
+    if (!client.connect(host, port)) {
+        Serial.println("Connection to PC failed");
+        return false;
+    }
+
+    Serial.println("Connected to server (PC)");
+
+    // Drain and echo whatever greeting the PC sends, if any. Purely a
+    // debugging aid -- nothing in the protocol requires a handshake.
+    // Waits up to 5 s for the first byte, then prints what has arrived.
+    unsigned long timeout = millis();
+    while (!client.available() && millis() - timeout < 5000) {}
+
+    while (client.available()) {
+        char c = client.read();
+        Serial.print(c);
+    }
+
+    ee_sent = sendCalibration();
+    return ee_sent;
 }
 
 
@@ -247,9 +317,44 @@ void setup() {
 // ===========================================================================
 
 void loop() {
-    int mlxStatus;
 
     /*
+     * ----- Connection maintenance -----------------------------------------
+     *
+     * Checked before any sensor work, so a dead socket is dealt with rather
+     * than having frames read and silently discarded into a closed client.
+     *
+     * client.connected() is true while the session is usable -- including
+     * when the peer has closed but unread data is still buffered -- and goes
+     * false once the connection is genuinely gone. That covers the PC-side
+     * script being restarted, which is the common case.
+     *
+     * The retry is non-blocking: if it is not yet time to try again the
+     * function simply returns and the next pass through loop() re-checks.
+     * A blocking delay here would be worse than useless, since client.connect()
+     * already stalls for its own timeout on a host that is not listening.
+     */
+    if (!client.connected()) {
+        if (millis() - lastReconnectAttempt < RECONNECT_INTERVAL_MS) {
+            return;
+        }
+        lastReconnectAttempt = millis();
+
+        Serial.println("Link down -- reconnecting");
+        connectToServer();
+        return;  // stream on the next pass, once the link is settled
+    }
+
+    // Belt and braces: a socket can be up while calibration failed to send,
+    // and frames are meaningless to the PC until it has that dump.
+    if (!ee_sent) {
+        ee_sent = sendCalibration();
+        return;
+    }
+
+    /*
+     * ----- Frame acquisition ----------------------------------------------
+     *
      * The MLX90640 never refreshes a whole image at once. It updates a
      * chess-board pattern of pixels, alternating between two "subpages":
      *
@@ -265,29 +370,75 @@ void loop() {
      * ready, so the pacing of this loop is set by the refresh rate configured
      * in setup(), not by any delay here.
      */
-    for (byte subpage = 0; subpage < 2; subpage++) {
+    for (byte i = 0; i < 2; i++) {
 
-        mlxStatus = MLX90640_GetFrameData(MLX90640_address, MLX90640Frame);
+        int mlxStatus = MLX90640_GetFrameData(MLX90640_address, MLX90640Frame);
 
-        // Word 833 is the subpage number, already reduced by the driver to a
-        // bare 0 or 1. On a healthy bus this prints a clean alternating
-        // 0, 1, 0, 1 -- if it sticks on one value you are only ever receiving
-        // half the image. (mlxStatus returns the same subpage number, or a
-        // negative value on an I2C read error; it is currently ignored, so a
-        // corrupted read still gets shipped to the PC as though it were good.)
-        Serial.print("[833]=");
-        Serial.print(MLX90640Frame[833]);
+        /*
+         * Validation, in increasing order of subtlety. Anything that fails is
+         * dropped rather than transmitted: a dropped frame costs the PC one
+         * stale half-image for a fraction of a second, whereas a corrupt one
+         * feeds garbage into the temperature conversion and shows up as
+         * plausible-looking but wrong readings.
+         */
 
-        if (client) {
-            client.write((const uint8_t*)"FR", 2);
-            client.write((uint8_t*)MLX90640Frame, MLX90640_FRAME_WORDS * 2);
+        // 1. Driver-level failure. On success this API returns the subpage
+        //    number; anything negative is an I2C or timeout error.
+        if (mlxStatus < 0) {
+            badFrames++;
+            Serial.print(" [read error ");
+            Serial.print(mlxStatus);
+            Serial.print("]");
+            continue;
         }
 
+        uint16_t subpage = MLX90640Frame[833];
+
+        // 2. Out-of-range subpage. The driver masks this to 0 or 1, so any
+        //    other value means the buffer is not holding what we think it is
+        //    -- a partial read, or a write that landed at the wrong offset.
+        if (subpage > 1) {
+            badFrames++;
+            Serial.print(" [bad subpage ");
+            Serial.print(subpage);
+            Serial.print("]");
+            continue;
+        }
+
+        // 3. Disagreement between the two places the subpage is reported.
+        //    Both derive from the same read, so they should always match;
+        //    if they do not, the buffer was disturbed mid-transfer.
+        if ((int)subpage != mlxStatus) {
+            badFrames++;
+            Serial.print(" [subpage mismatch ");
+            Serial.print(mlxStatus);
+            Serial.print("/");
+            Serial.print(subpage);
+            Serial.print("]");
+            continue;
+        }
+
+        // Trace: healthy output alternates 0, 1, 0, 1. A value that sticks
+        // means only half the image is ever refreshing.
+        Serial.print("subpage #");
+        Serial.print(subpage);
+        Serial.print("\t");
+
+        client.write((const uint8_t*)"FR", 2);
+        client.write((uint8_t*)MLX90640Frame, MLX90640_FRAME_WORDS * 2);
+
         // Blocks until the outgoing buffer is drained, trading throughput for
-        // the guarantee that frames do not pile up in RAM. Sits outside the
-        // `if (client)` guard, matching the original -- harmless on a dead
-        // client, but it is doing nothing useful there either.
+        // the guarantee that frames do not pile up in RAM. Now inside the
+        // connected path, where it actually has something to do.
         client.flush();
+    }
+
+    // Running tally, so a bus that is degrading slowly is visible without
+    // having to stare at the trace.
+    if (badFrames > 0) {
+        Serial.print(" (dropped ");
+        Serial.print(badFrames);
+        Serial.print(")");
     }
 }
 
