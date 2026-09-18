@@ -357,7 +357,7 @@ def main() -> None:
             )
             artists.append([im])  # ArtistAnimation expects a list of artists per frame
 
-            j += 1
+            j += 2
 
     print(f"\nTemperatures written to {temperatures_txt_file}")
     if total_skipped:
