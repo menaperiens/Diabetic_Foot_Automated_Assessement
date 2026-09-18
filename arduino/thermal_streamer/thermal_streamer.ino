@@ -432,8 +432,9 @@ void loop() {
 
         // Trace: healthy output alternates 0, 1, 0, 1. A value that sticks
         // means only half the image is ever refreshing.
-        Serial.print("[833]=");
+        Serial.print("subpage #");
         Serial.print(subpage);
+        Serial.print("\t");
 
         client.write((const uint8_t*)"FR", 2);
         client.write((uint8_t*)MLX90640Frame, MLX90640_FRAME_WORDS * 2);
