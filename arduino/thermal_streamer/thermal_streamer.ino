@@ -26,14 +26,16 @@
  *   little-endian uint16_t values. There is no length prefix, no checksum,
  *   and no delimiter -- the receiver must know the sizes in advance.
  *
- *     "EE" + 832 uint16  (1664 bytes)  sent once per TCP session, before any
+ *     "EE" + 832 uint16  (1664 bytes)  sent once per boot, on the first
+ *                                      successful connection, before any
  *                                      frames. The sensor's calibration
- *                                      EEPROM dump. The PC needs this before
+ *                                      EEPROM dump, needed by the PC before
  *                                      it can convert any frame to
- *                                      temperatures, so a receiver that sees
- *                                      a new connection should expect "EE"
- *                                      first and discard any cached copy from
- *                                      a previous session.
+ *                                      temperatures. It is NOT repeated on a
+ *                                      reconnect, so a PC-side script that
+ *                                      restarts mid-run must be restarted
+ *                                      alongside the board, or it will
+ *                                      receive frames it cannot convert.
  *
  *     "FR" + 834 uint16  (1668 bytes)  sent continuously, two per full image.
  *                                      A raw subpage frame (see loop()).
@@ -120,10 +122,13 @@ static paramsMLX90640 params;  // calibration coefficients, unpacked from EEPROM
 /*
  * Connection state.
  *
- * The calibration dump is per-connection, not per-boot: every time a fresh
- * TCP session opens, the PC on the other end is a fresh parser that has not
- * seen an "EE" message yet. So this flag is cleared on disconnect and set
- * again once calibration has been re-sent on the new socket.
+ * Calibration is sent once per boot, not per connection. The dump is burned
+ * into the sensor at the factory and never changes, so re-sending it on a
+ * reconnect would only duplicate bytes the PC already holds.
+ *
+ * The flag latches on the first successful send rather than simply being set
+ * in setup(), so that a board powered on before the PC-side script is running
+ * still delivers calibration once the first connection succeeds.
  */
 bool ee_sent = false;
 
@@ -272,17 +277,16 @@ bool sendCalibration() {
 }
 
 /*
- * Opens a session to the PC and primes it with calibration.
+ * Opens a session to the PC, sending calibration if it has not gone out yet.
  *
- * Returns true only when both halves succeeded, because a socket that is
- * open but has not been sent an "EE" message is useless to the receiver --
- * it would be parsing frames it cannot convert.
+ * Returns true once the link is up and the PC has calibration -- on a
+ * reconnect that means simply that the socket opened, since the dump was
+ * already delivered earlier in this boot.
  */
 bool connectToServer() {
     // Releases any half-open socket from a previous session. Without this the
     // client can hold onto a stale descriptor and refuse to reconnect.
     client.stop();
-    ee_sent = false;
 
     Serial.print("Connecting to ");
     Serial.print(host);
@@ -307,8 +311,14 @@ bool connectToServer() {
         Serial.print(c);
     }
 
-    ee_sent = sendCalibration();
-    return ee_sent;
+    // First successful connection of this boot carries the calibration dump;
+    // later reconnects skip it, since the PC already has it.
+    if (!ee_sent) {
+        ee_sent = sendCalibration();
+        return ee_sent;
+    }
+
+    return true;
 }
 
 
@@ -345,8 +355,10 @@ void loop() {
         return;  // stream on the next pass, once the link is settled
     }
 
-    // Belt and braces: a socket can be up while calibration failed to send,
-    // and frames are meaningless to the PC until it has that dump.
+    // Recovery path only: the link is up but calibration never made it out,
+    // because an earlier attempt hit an I2C error. Retries until it succeeds,
+    // since frames are meaningless to the PC without that dump. Once the flag
+    // latches this never runs again for the rest of the boot.
     if (!ee_sent) {
         ee_sent = sendCalibration();
         return;
@@ -420,9 +432,8 @@ void loop() {
 
         // Trace: healthy output alternates 0, 1, 0, 1. A value that sticks
         // means only half the image is ever refreshing.
-        Serial.print("subpage #");
+        Serial.print("[833]=");
         Serial.print(subpage);
-        Serial.print("\t");
 
         client.write((const uint8_t*)"FR", 2);
         client.write((uint8_t*)MLX90640Frame, MLX90640_FRAME_WORDS * 2);
