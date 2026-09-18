@@ -41,7 +41,7 @@ import adafruit_mlx90640 as mlx_lib
 # ---------------------------------------------------------------------------
 
 CAPTURE_DIR = Path("C:/Users/joaos/Desktop/arduino_IR_final/ino_raw_data_bin")
-FRAME_FILE = CAPTURE_DIR / "bin" / "2026-09-18_11_44_06_frames_thermal.bin" 
+FRAME_FILE = CAPTURE_DIR / "bin" / "2026-09-18_12_09_11_frames_thermal.bin" # "2026-09-18_11_44_06_frames_thermal.bin" 
 CALIBRATION_FILE = CAPTURE_DIR / "2026-09-17_22_17_53_EE_calb_data.bin"
 
 # One line of comma-separated raw temperatures (deg C) per reconstructed

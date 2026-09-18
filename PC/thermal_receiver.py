@@ -23,9 +23,9 @@ WIRE PROTOCOL (Arduino -> PC)
 
 OUTPUT
 
-  Calibration goes to one CSV and one .bin per connection, so a reconnecting
+  Calibration goes to one .bin per connection, so a reconnecting
   Arduino does not append a second dump to the first session's files.
-  Frames go to one CSV and one .bin per capture run, named when START is
+  Frames go to one .bin per capture run, named when START is
   received, so a whole run lands in a single pair of files. Each row still
   carries its own frame's arrival time in its first column.
 """
@@ -75,13 +75,8 @@ def u16_struct(count: int) -> struct.Struct:
 
 
 def now_tag() -> str:
-    """Timestamp string used in filenames and CSV rows. One-second resolution."""
+    """Timestamp string used in filenames. One-second resolution."""
     return datetime.now().strftime("%Y-%m-%d_%H_%M_%S")
-
-
-def append_csv_line(path: Path, line: str) -> None:
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
 
 
 def append_u16_bin(path: Path, values) -> None:
@@ -234,10 +229,9 @@ def read_packet(conn: socket.socket, addr) -> tuple[str, tuple] | None:
 def handle_calibration(values: tuple, stamp: str, session_tag: str) -> None:
     print(f"Received EE packet with {len(values)} words")
 
-    csv_path = SAVING_DIR / "csv" / "EE_calb_data.csv"
+
     bin_path = SAVING_DIR / "bin" /"EE_calb_data.bin"
 
-    append_csv_line(csv_path, f"{stamp},EE," + ",".join(map(str, values)))
     append_u16_bin(bin_path, values)
 
 
@@ -249,12 +243,10 @@ def handle_frame(values: tuple, state: CaptureState, stamp: str) -> None:
         return
 
     # Named for the capture run, so all frames of one START land together.
-    csv_path = SAVING_DIR / "csv" / f"{capture_tag}_frames_thermal.csv"
     bin_path = SAVING_DIR / "bin" / f"{capture_tag}_frames_thermal.bin"
 
     # The row keeps this frame's own arrival time, so per-frame timing is
     # still recoverable from inside the file.
-    append_csv_line(csv_path, f"{stamp},FR," + ",".join(map(str, values)))
     append_u16_bin(bin_path, values)
 
     state.record_saved()
@@ -278,11 +270,7 @@ def serve_client(conn: socket.socket, addr, state: CaptureState) -> None:
         if packet is None:
             break
 
-        # Sampled once, after the packet lands, and used for both the
-        # filename and the CSV row so the two always agree. (Previously the
-        # filename stamp was taken before the blocking read -- recording when
-        # the wait started -- while the row stamp was taken after it, so the
-        # two could disagree by a second or more.)
+        # Sampled once, after the packet lands.
         stamp = now_tag()
 
         tag, values = packet
