@@ -3,9 +3,24 @@ Offline viewer/animator for MLX90640 thermal captures recorded by the
 Arduino streamer + PC receiver pair.
 
 Reads a raw frame .bin file (one 834-uint16 record per subpage, as written
-by thermal_receiver.py) and the calibration .bin captured at boot, pairs
-consecutive subpages back into full 32x24 temperature images using the
-Adafruit MLX90640 driver's conversion math, and animates the result.
+by thermal_receiver.py) and the calibration .bin (also written by
+thermal_receiver.py), pairs consecutive subpages back into full 32x24
+temperature images using the Adafruit MLX90640 driver's conversion math,
+and animates the result.
+
+USAGE
+    python conversion_bin_tem.py <frame_file>
+
+    <frame_file> is the capture run to analyze. Two forms are accepted:
+
+      - A bare filename, e.g.:
+            python conversion_bin_tem.py 2026-09-18_12_09_11_frames_thermal.bin
+        resolved automatically under <CAPTURE_DIR>/bin/, the same folder
+        thermal_receiver.py writes into.
+
+      - A full or relative path, e.g.:
+            python conversion_bin_tem.py C:/path/to/some_frames_thermal.bin
+        used exactly as given, for a capture living somewhere else.
 
 DEPENDENCIES
     adafruit_mlx90640.py must sit in the same folder as this script.
@@ -15,7 +30,7 @@ CALIBRATION REUSE (OfflineMLX)
     its own __init__. There is no public entry point for "I already have the
     EEPROM dump on disk, just use it" -- so OfflineMLX below skips the
     parent __init__ entirely and pokes the driver's private module-level
-    state directly (a.eeData) before calling its private parameter-
+    state directly (mlx_lib.eeData) before calling its private parameter-
     extraction method. This works today against the Adafruit CircuitPython
     driver, but every name it touches is underscore-prefixed, meaning the
     library makes no compatibility promise about them. An upgrade of
@@ -24,6 +39,7 @@ CALIBRATION REUSE (OfflineMLX)
     library, this class is the first place to check.
 """
 
+import argparse
 import struct
 from pathlib import Path
 
@@ -40,16 +56,21 @@ import adafruit_mlx90640 as mlx_lib
 # Configuration
 # ---------------------------------------------------------------------------
 
-CAPTURE_DIR = Path("C:/Users/joaos/Desktop/arduino_IR_final/ino_raw_data_bin")
-FRAME_FILE = CAPTURE_DIR / "bin" / "2026-09-18_12_09_11_frames_thermal.bin" # "2026-09-18_11_44_06_frames_thermal.bin" 
-CALIBRATION_FILE = CAPTURE_DIR / "2026-09-17_22_17_53_EE_calb_data.bin"
+# Not hardcoded to a specific user/OS path: Path.home() resolves to the
+# current user's home directory wherever this runs. Matches the directory
+# thermal_receiver.py writes into -- CAPTURE_DIR here and SAVING_DIR there
+# are built the same way, so they line up on the same machine without
+# needing to be kept in sync by hand.
+CAPTURE_DIR = Path.home() / "Documents" / "arduino_IR_final" / "ino_raw_data_bin"
 
-# One line of comma-separated raw temperatures (deg C) per reconstructed
-# frame -- i.e. per subpage PAIR, not per record in the .bin file. Line N
-# corresponds to the frame printed as "FRAME NUMBER: N" in the console.
-# Named from FRAME_FILE so it's easy to tell which capture it came from.
-TEMPERATURES_TXT_FILE = CAPTURE_DIR.parent / "ino_temperatures" / (FRAME_FILE.stem + "_temperatures.txt")
+# Calibration is a single, fixed filename that thermal_receiver.py
+# overwrites on every "EE" packet -- there is no timestamp in its name and
+# no old version to point at by mistake, unlike the frame file, which is
+# now supplied on the command line (see resolve_frame_file() below) rather
+# than hardcoded here.
+CALIBRATION_FILE = CAPTURE_DIR / "bin" / "EE_calb_data.bin"
 
+TEMPERATURES_DIR = CAPTURE_DIR.parent / "ino_temperatures"
 
 # Words per record. Matches the Arduino sketch's MLX90640Frame buffer: 768
 # pixel words (32x24) + 64 auxiliary/housekeeping words + control register +
@@ -71,9 +92,9 @@ EMISSIVITY = 0.95
 # Display-only remapping: raw temperatures (deg C, roughly) are rescaled
 # into this range before feeding the 'hsv' colormap, purely so the colour
 # wheel spans a usable band rather than being dominated by outliers.
-# Left as 'hsv', to compare with a previous script that does the live visualization
-# and using 'hsv' ; however, a perceptually-ordered map such as
-# 'inferno' or 'turbo' would avoid the wraparound where the hottest and
+# Left as 'hsv', to compare with a previous script that does the live
+# visualization and using 'hsv'; however, a perceptually-ordered map such
+# as 'inferno' or 'turbo' would avoid the wraparound where the hottest and
 # coldest pixels can end up visually similar colours.
 DISPLAY_MIN = 160
 DISPLAY_MAX = 360
@@ -83,8 +104,54 @@ ANIMATION_INTERVAL_MS = 100
 
 
 # ---------------------------------------------------------------------------
+# Command-line argument
+# ---------------------------------------------------------------------------
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Reconstruct and view temperatures from an MLX90640 capture.",
+    )
+    parser.add_argument(
+        "frame_file",
+        help=(
+            "Frame capture .bin file to analyze. Either a bare filename "
+            "(resolved under <CAPTURE_DIR>/bin/) or a full/relative path."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def resolve_frame_file(raw_arg: str) -> Path:
+    """
+    Turn the command-line argument into an actual path to read.
+
+    A bare filename (no directory component, e.g. "foo_frames_thermal.bin")
+    is resolved under <CAPTURE_DIR>/bin/, the same folder
+    thermal_receiver.py writes into -- this is the common case, letting you
+    just paste the filename the receiver printed without retyping the whole
+    path. Anything with a directory component (an absolute path, or a
+    relative one like "../elsewhere/foo.bin") is used exactly as given.
+    """
+    p = Path(raw_arg)
+    if p.parent == Path("."):
+        return CAPTURE_DIR / "bin" / p.name
+    return p
+
+
+# ---------------------------------------------------------------------------
 # Raw file I/O
 # ---------------------------------------------------------------------------
+
+
+def ensure_directories() -> None:
+    """
+    Create the output directory this script writes into, if not already
+    there. Called once at startup rather than at import time, so a caller
+    that overrides TEMPERATURES_DIR before calling main() still gets the
+    right directory created.
+    """
+    TEMPERATURES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def read_u16_file(path: Path) -> list[int]:
@@ -144,11 +211,6 @@ def next_subpage_pair(frame_path: Path, start_index: int):
     records on every attempt so the pair being compared is always current,
     until an alternating pair is found -- and reports how many records had
     to be skipped to get there.
-
-    (Earlier version of this function only re-read the first record of the
-    pair inside the retry loop; the second stayed pinned to its original
-    read from before the loop started, so it was comparing a moving record
-    against a frozen one and could not actually detect a repeat correctly.)
 
     Returns (subpage_a, subpage_b, pair_index, skipped).
     """
@@ -240,10 +302,20 @@ def write_temperatures_line(f, temps: list[float]) -> None:
 
 
 def main() -> None:
+    args = parse_args()
+    frame_file = resolve_frame_file(args.frame_file)
+
+    if not frame_file.exists():
+        raise SystemExit(f"Frame file not found: {frame_file}")
+
+    ensure_directories()
+
+    temperatures_txt_file = TEMPERATURES_DIR / (frame_file.stem + "_temperatures.txt")
+
     ee_words = read_u16_file(CALIBRATION_FILE)
     mlx = OfflineMLX(ee_words)
 
-    total_records = count_frames(FRAME_FILE)
+    total_records = count_frames(frame_file)
 
     fig, ax = plt.subplots()
     artists = []
@@ -257,10 +329,10 @@ def main() -> None:
     # or a later frame raises. "w" starts a fresh file per run; switch to
     # "a" if you'd rather append across multiple runs against the same
     # capture.
-    with open(TEMPERATURES_TXT_FILE, "w", encoding="utf-8") as temps_file:
+    with open(temperatures_txt_file, "w", encoding="utf-8") as temps_file:
 
         while j < total_records - 1:
-            subpage_a, subpage_b, j, skipped = next_subpage_pair(FRAME_FILE, j)
+            subpage_a, subpage_b, j, skipped = next_subpage_pair(frame_file, j)
             total_skipped += skipped
 
             image_number += 1
@@ -287,7 +359,7 @@ def main() -> None:
 
             j += 1
 
-    print(f"\nTemperatures written to {TEMPERATURES_TXT_FILE}")
+    print(f"\nTemperatures written to {temperatures_txt_file}")
     if total_skipped:
         print(f"Total records skipped due to repeated subpages: {total_skipped}")
 

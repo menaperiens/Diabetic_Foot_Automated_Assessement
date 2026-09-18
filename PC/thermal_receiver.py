@@ -23,11 +23,20 @@ WIRE PROTOCOL (Arduino -> PC)
 
 OUTPUT
 
-  Calibration goes to one .bin per connection, so a reconnecting
-  Arduino does not append a second dump to the first session's files.
-  Frames go to one .bin per capture run, named when START is
-  received, so a whole run lands in a single pair of files. Each row still
-  carries its own frame's arrival time in its first column.
+  Both calibration and frames are written as raw .bin files under
+  SAVING_DIR / "bin" (created automatically if missing -- see
+  ensure_directories()).
+
+  Calibration is written to one FIXED filename, EE_calb_data.bin, and is
+  OVERWRITTEN in full on every "EE" packet -- never appended. Since the
+  Arduino only ever sends one calibration dump per boot, this file always
+  holds exactly the most recent boot's dump, with nothing left over from
+  any earlier one.
+
+  Frames go to one .bin per capture run, named when START is received, so
+  a whole run lands in a single file. Frame records carry no timestamp of
+  their own inside the file -- the run's filename tag is the only timing
+  marker, at one-per-run resolution.
 """
 
 import socket
@@ -40,7 +49,12 @@ from pathlib import Path
 # Configuration
 # ---------------------------------------------------------------------------
 
-SAVING_DIR = Path("C:/Users/joaos/Desktop/arduino_IR_final/ino_raw_data_bin")
+# Not hardcoded to a specific user/OS path: Path.home() resolves to the
+# current user's home directory on whatever machine this runs on (e.g.
+# C:\Users\<name> on Windows, /home/<name> on Linux/macOS). The directory
+# itself is created automatically at startup by ensure_directories() below,
+# so nothing needs to exist beforehand.
+SAVING_DIR = Path.home() / "Documents" / "arduino_IR_final" / "ino_raw_data_bin"
 
 HOST = "0.0.0.0"
 DATA_PORT = 8080
@@ -49,6 +63,8 @@ TRIGGER_PORT = 8081
 TOTAL_FRAMES = 30       # frames captured per START before saving auto-stops
 TRIGGER_RECV_BYTES = 1024
 CLIENT_DISCONNECT_MSG = "Client disconnected"
+
+CALIBRATION_FILENAME = "EE_calb_data.bin"
 
 # Payload length, in 16-bit words, for each packet tag.
 PAYLOAD_WORDS = {"EE": 832, "FR": 834}
@@ -79,8 +95,26 @@ def now_tag() -> str:
     return datetime.now().strftime("%Y-%m-%d_%H_%M_%S")
 
 
+def ensure_directories() -> None:
+    """
+    Create every directory this script writes into, if not already there.
+
+    Called once at startup rather than at import time, so tests (or any
+    other caller) that override SAVING_DIR before calling main() still get
+    the right directory created, not the default.
+    """
+    (SAVING_DIR / "bin").mkdir(parents=True, exist_ok=True)
+
+
 def append_u16_bin(path: Path, values) -> None:
+    """Add one record's worth of raw words to the end of `path`."""
     with open(path, "ab") as f:
+        f.write(u16_struct(len(values)).pack(*values))
+
+
+def overwrite_u16_bin(path: Path, values) -> None:
+    """Replace `path`'s entire contents with this one record's raw words."""
+    with open(path, "wb") as f:
         f.write(u16_struct(len(values)).pack(*values))
 
 
@@ -122,8 +156,8 @@ class CaptureState:
         Enable saving, reset the counter, and stamp this capture run.
 
         The tag is fixed here rather than per packet, so every frame of a run
-        is appended to the same pair of files. Pressing START again begins a
-        new run and a new pair.
+        is appended to the same file. Pressing START again begins a new run
+        and a new file.
         """
         with self._lock:
             self._enabled = True
@@ -147,15 +181,20 @@ class CaptureState:
         with self._lock:
             return self._tag if self._enabled else None
 
-    def record_saved(self) -> None:
-        """Count a written frame and disable saving once the quota is met."""
+    def record_saved(self, path: Path) -> None:
+        """
+        Count a written frame and disable saving once the quota is met.
+
+        Takes the destination path purely so the console output can say
+        where the frame went, without a second lock-protected lookup.
+        """
         with self._lock:
             self._saved += 1
-            print(f"Saved frame {self._saved}/{self._total}")
+            print(f"Saved frame {self._saved}/{self._total} -> {path}")
 
             if self._saved >= self._total:
                 self._enabled = False
-                print(f"Captured {self._total} frames. Saving disabled.")
+                print(f"Captured {self._total} frames. Saved to {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -226,16 +265,24 @@ def read_packet(conn: socket.socket, addr) -> tuple[str, tuple] | None:
     return tag, values
 
 
-def handle_calibration(values: tuple, stamp: str, session_tag: str) -> None:
+def handle_calibration(values: tuple) -> None:
+    """
+    Overwrite the single calibration file with this dump.
+
+    Always a full overwrite, never an append: the Arduino sends exactly one
+    dump per boot, so this file is only ever meant to hold the most recent
+    one. Appending here would let stale calibration from an earlier boot
+    linger indefinitely alongside the current one.
+    """
     print(f"Received EE packet with {len(values)} words")
 
+    bin_path = SAVING_DIR / "bin" / CALIBRATION_FILENAME
+    overwrite_u16_bin(bin_path, values)
 
-    bin_path = SAVING_DIR / "bin" /"EE_calb_data.bin"
-
-    append_u16_bin(bin_path, values)
+    print(f"Saved calibration to {bin_path}")
 
 
-def handle_frame(values: tuple, state: CaptureState, stamp: str) -> None:
+def handle_frame(values: tuple, state: CaptureState) -> None:
     print("Received FR packet")
 
     capture_tag = state.capture_tag()
@@ -245,43 +292,28 @@ def handle_frame(values: tuple, state: CaptureState, stamp: str) -> None:
     # Named for the capture run, so all frames of one START land together.
     bin_path = SAVING_DIR / "bin" / f"{capture_tag}_frames_thermal.bin"
 
-    # The row keeps this frame's own arrival time, so per-frame timing is
-    # still recoverable from inside the file.
     append_u16_bin(bin_path, values)
-
-    state.record_saved()
+    state.record_saved(bin_path)
 
 
 def serve_client(conn: socket.socket, addr, state: CaptureState) -> None:
-    """
-    Read packets from one Arduino connection until it goes away.
-
-    The session tag is fixed for the lifetime of this connection, so each
-    time the Arduino reconnects its calibration dump lands in a fresh pair of
-    files rather than being appended to the previous session's. The board
-    re-sends calibration on every reconnect, so without this one file would
-    accumulate an extra 832-word row per reconnect, with nothing to indicate
-    which frames belong to which row.
-    """
-    session_tag = now_tag()
-
+    """Read packets from one Arduino connection until it goes away."""
     while True:
         packet = read_packet(conn, addr)
         if packet is None:
             break
 
-        # Sampled once, after the packet lands.
-        stamp = now_tag()
-
         tag, values = packet
 
         if tag == "EE":
-            handle_calibration(values, stamp, session_tag)
+            handle_calibration(values)
         elif tag == "FR":
-            handle_frame(values, state, stamp)
+            handle_frame(values, state)
 
 
 def main() -> None:
+    ensure_directories()
+
     state = CaptureState(TOTAL_FRAMES)
 
     threading.Thread(target=trigger_server, args=(state,), daemon=True).start()
@@ -292,6 +324,7 @@ def main() -> None:
         s.listen()
 
         print(f"Listening on {HOST}:{DATA_PORT} ...")
+        print(f"Saving under: {SAVING_DIR / 'bin'}")
 
         while True:
             conn, addr = s.accept()
