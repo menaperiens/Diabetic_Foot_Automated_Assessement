@@ -238,7 +238,7 @@ void setup() {
 /*
  * Reads the sensor's factory calibration EEPROM and forwards it to the PC.
  *
- * Called once per TCP session rather than once per boot. The dump is read
+ * Called once per boot. The dump is read
  * fresh from the sensor each time instead of being cached in a global: at
  * 1664 bytes that would be a permanent bite out of RAM, which is already at
  * roughly two-thirds occupancy on this board. Here it lives on the stack for
