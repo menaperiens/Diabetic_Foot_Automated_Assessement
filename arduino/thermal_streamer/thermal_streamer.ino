@@ -11,8 +11,7 @@
  *
  * DEPENDENCIES
  *   MLX90640_API.h / MLX9064X_I2C_Driver.h from the Melexis driver
- *   (as redistributed by SparkFun). These are .h/.cpp files dropped into
- *   the sketch folder, not a Library Manager entry.
+ *   are provided by the Seeed_Arduino_MLX9064X library.
  *
  * WHAT THIS SKETCH DOES NOT DO
  *   No temperature conversion happens on the board. The Arduino ships the
