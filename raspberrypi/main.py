@@ -76,10 +76,10 @@ def pause_for_debug(message="Press Enter to continue..."):
 
 def wait_for_button_press():
     """Block until the start button is pressed."""
-    print("Press the button to begin.")
+    print("Pressione o botão para iniciar.")
     while not button.value:
         sleep(0.5)
-    print("Button pressed. Starting process...")
+    print("Botão pressionado. Iniciando processo...")
 
 
 def notify_arduino():
